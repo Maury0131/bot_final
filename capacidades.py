@@ -22,7 +22,7 @@ from config import DATOS, settings
 # ═══ S1 · Tools de lectura con APIs públicas ══════════════════════════════════════════
 apis = Capability(
     id="apis_publicas",
-    description="Consulta indicadores económicos (Banco Mundial) y clima (Open Meteo) con sus APIs públicas",
+    description="Consulta indicadores económicos (Banco Mundial), tipo de cambio (ExchangeRate) y clima (Open Meteo)",
     instructions="Usa las APIs para obtener datos reales. Si una API no tiene el dato, dilo, y no inventes datos",
 )
 
@@ -40,7 +40,6 @@ def inflacion(pais: str, anio: int) -> dict:
     respuesta.raise_for_status()
     datos = respuesta.json()
 
-    # La API responde [metadatos, registros]. Si no hay dato, devolvemos un aviso que el modelo puede leer
     if len(datos) < 2 or not datos[1] or datos[1][0]["value"] is None:
         return {"error": f"No hay datos de inflación disponibles para {pais} en {anio}"}
 
@@ -49,7 +48,7 @@ def inflacion(pais: str, anio: int) -> dict:
         "pais": registro["country"]["value"],
         "anio": registro["date"],
         "inflacion_pct": round(registro["value"], 2),
-        "fuente": "Banco Mundial",  # devolver la fuente evita que el modelo invente una
+        "fuente": "Banco Mundial",
     }
 
 
@@ -62,10 +61,40 @@ def clima_cochabamba() -> dict:
     return {"temperatura": respuesta.json()["current"]["temperature_2m"], "fuente": "Open Meteo"}
 
 
-# ═══ S1 · Mi contador: gastos en SQLite, una tool que lee y otra que escribe ══════════
+@apis.tool_plain
+def clima_sucre() -> dict:
+    """Temperatura actual, lluvia y viento en Sucre, Bolivia, para planificar inspecciones judiciales (Open Meteo)."""
+    params = {
+        "latitude": -19.0333,
+        "longitude": -65.2627,
+        "current": ["temperature_2m", "precipitation", "wind_speed_10m"],
+        "timezone": "America/La_Paz",
+    }
+    respuesta = httpx.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=10)
+    respuesta.raise_for_status()
+    actual = respuesta.json()["current"]
+    return {
+        "ciudad": "Sucre",
+        "temperatura_c": actual["temperature_2m"],
+        "precipitacion_mm": actual["precipitation"],
+        "viento_kmh": actual["wind_speed_10m"],
+        "fuente": "Open Meteo",
+    }
+
+
+@apis.tool_plain
+def tipo_cambio_usd() -> dict:
+    """Tipo de cambio oficial de dólar (USD) a bolivianos (BOB) según ExchangeRate-API para liquidaciones o fianzas."""
+    respuesta = httpx.get("https://open.er-api.com/v6/latest/USD", timeout=10)
+    respuesta.raise_for_status()
+    tasa = respuesta.json()["rates"]["BOB"]
+    return {"moneda_base": "USD", "moneda_destino": "BOB", "tipo_cambio": tasa, "fuente": "ExchangeRate-API"}
+
+
+# ═══ S1 · Mi contador: gastos en SQLite (se mantiene para compatibilidad con pytest) ═══
 Categoria = Literal["transporte", "alimentacion", "educacion", "ocio", "salud"]
-CSV = DATOS / "gastos.csv"  # 10 gastos ficticios de mayo de 2030
-DB = DATOS / "gastos.db"  # la base: se crea desde el CSV la primera vez
+CSV = DATOS / "gastos.csv"
+DB = DATOS / "gastos.db"
 
 
 def crear_base() -> None:
@@ -87,7 +116,6 @@ def hoy() -> str:
     return f"Hoy es {date.today().isoformat()}."
 
 
-# Lectura y escritura van en capabilities separadas: a otro agente le podrías dar solo la primera
 consulta = Capability(
     id="consulta_gastos",
     description="Consulta gastos personales almacenados en una base de datos SQLite",
@@ -105,10 +133,10 @@ def consultar_gastos(categoria: Categoria) -> dict:
     """Gastos de una categoría y su total en bolivianos."""
     if not DB.exists():
         crear_base()
-    conexion = sqlite3.connect(DB.resolve().as_uri() + "?mode=ro", uri=True)  # solo lectura
-    conexion.row_factory = sqlite3.Row  # cada fila como diccionario
+    conexion = sqlite3.connect(DB.resolve().as_uri() + "?mode=ro", uri=True)
+    conexion.row_factory = sqlite3.Row
     filas = conexion.execute(
-        "SELECT fecha, descripcion, monto FROM gastos WHERE categoria = ?",  # SQL fijo; el valor va en ?
+        "SELECT fecha, descripcion, monto FROM gastos WHERE categoria = ?",
         (categoria,),
     ).fetchall()
     conexion.close()
@@ -120,24 +148,149 @@ def registrar_gasto(fecha: str, categoria: Categoria, descripcion: str, monto: f
     """Anota un gasto nuevo. La fecha va como AAAA-MM-DD y el monto en bolivianos."""
     if not DB.exists():
         crear_base()
-    conexion = sqlite3.connect(DB)  # sin mode=ro: esta tool sí escribe
+    conexion = sqlite3.connect(DB)
     try:
-        with conexion:  # transacción: guarda todo o nada
+        with conexion:
             conexion.execute("INSERT INTO gastos VALUES (?, ?, ?, ?)", (fecha, categoria, descripcion, monto))
-    except sqlite3.IntegrityError:  # el CHECK de la tabla rechaza montos de 0 o negativos
+    except sqlite3.IntegrityError:
         return f"No se guardó: el monto debe ser mayor que 0 (recibí {monto})."
     finally:
         conexion.close()
     return f"Gasto registrado: {descripcion}, {monto} Bs en {categoria} el {fecha}."
 
 
+# ═══ S1-B · Despacho Judicial: Audiencias, Plazos y Estadísticas en SQLite ═════════════
+Materia = Literal["Familiar", "Civil", "Laboral"]
+CSV_CAUSAS = DATOS / "causas.csv"
+DB_CAUSAS = DATOS / "causas.db"
+
+
+def crear_base_judicial() -> None:
+    """Crea causas.db desde causas.csv la primera vez."""
+    DB_CAUSAS.unlink(missing_ok=True)
+    with CSV_CAUSAS.open(encoding="utf-8") as archivo:
+        filas = [
+            (
+                c["expediente"],
+                c["materia"],
+                c["partes"],
+                c["tipo_acto"],
+                c["fecha_audiencia"],
+                c["hora"],
+                c["estado"],
+                c["fecha_limite_plazo"],
+            )
+            for c in csv.DictReader(archivo)
+        ]
+    conexion = sqlite3.connect(DB_CAUSAS)
+    with conexion:
+        conexion.execute(
+            """CREATE TABLE causas (
+                expediente TEXT, materia TEXT, partes TEXT, tipo_acto TEXT,
+                fecha_audiencia TEXT, hora TEXT, estado TEXT, fecha_limite_plazo TEXT
+            )"""
+        )
+        conexion.executemany("INSERT INTO causas VALUES (?, ?, ?, ?, ?, ?, ?, ?)", filas)
+    conexion.close()
+
+
+despacho = Capability(
+    id="despacho_judicial",
+    description="Consulta y programa audiencias judiciales, revisa plazos por vencer y estadísticas del juzgado",
+    instructions=[
+        "Usa las herramientas de despacho para responder sobre audiencias, expedientes, estadísticas y plazos. "
+        "No inventes expedientes ni nombres de partes.",
+        hoy,
+    ],
+)
+
+
+@despacho.tool_plain
+def consultar_audiencias(fecha: str | None = None, materia: Materia | None = None) -> dict:
+    """Lista las audiencias y causas filtrando opcionalmente por fecha (AAAA-MM-DD) o materia (Familiar, Civil, Laboral)."""
+    if not DB_CAUSAS.exists():
+        crear_base_judicial()
+    conexion = sqlite3.connect(DB_CAUSAS.resolve().as_uri() + "?mode=ro", uri=True)
+    conexion.row_factory = sqlite3.Row
+    sql = "SELECT * FROM causas WHERE 1=1"
+    params: list[str] = []
+    if fecha:
+        sql += " AND fecha_audiencia = ?"
+        params.append(fecha)
+    if materia:
+        sql += " AND materia = ?"
+        params.append(materia)
+    sql += " ORDER BY fecha_audiencia, hora"
+    filas = conexion.execute(sql, params).fetchall()
+    conexion.close()
+    return {"total": len(filas), "audiencias": [dict(f) for f in filas]}
+
+
+@despacho.tool_plain
+def procesos_por_vencer(fecha_hasta: str) -> dict:
+    """Devuelve los expedientes cuyo plazo procesal vence en o antes de la fecha indicada (AAAA-MM-DD), ordenados por urgencia."""
+    if not DB_CAUSAS.exists():
+        crear_base_judicial()
+    conexion = sqlite3.connect(DB_CAUSAS.resolve().as_uri() + "?mode=ro", uri=True)
+    conexion.row_factory = sqlite3.Row
+    filas = conexion.execute(
+        "SELECT expediente, materia, partes, tipo_acto, estado, fecha_limite_plazo "
+        "FROM causas WHERE fecha_limite_plazo <= ? ORDER BY fecha_limite_plazo ASC",
+        (fecha_hasta,),
+    ).fetchall()
+    conexion.close()
+    return {"urgentes_encontrados": len(filas), "expedientes": [dict(f) for f in filas]}
+
+
+@despacho.tool_plain
+def estadisticas_juzgado() -> dict:
+    """Calcula el total de causas por materia y por estado procesal (Pendiente vs En Despacho)."""
+    if not DB_CAUSAS.exists():
+        crear_base_judicial()
+    conexion = sqlite3.connect(DB_CAUSAS.resolve().as_uri() + "?mode=ro", uri=True)
+    por_materia = dict(conexion.execute("SELECT materia, COUNT(*) FROM causas GROUP BY materia").fetchall())
+    por_estado = dict(conexion.execute("SELECT estado, COUNT(*) FROM causas GROUP BY estado").fetchall())
+    conexion.close()
+    return {"total_causas": sum(por_materia.values()), "por_materia": por_materia, "por_estado": por_estado}
+
+
+@despacho.tool_plain
+def programar_audiencia(
+    expediente: str,
+    materia: Materia,
+    partes: str,
+    tipo_acto: str,
+    fecha_audiencia: str,
+    hora: str,
+    fecha_limite_plazo: str,
+) -> str:
+    """Programa una nueva audiencia en el juzgado verificando que no haya choque de fecha y hora."""
+    if not DB_CAUSAS.exists():
+        crear_base_judicial()
+    conexion = sqlite3.connect(DB_CAUSAS)
+    try:
+        choque = conexion.execute(
+            "SELECT expediente, partes FROM causas WHERE fecha_audiencia = ? AND hora = ?",
+            (fecha_audiencia, hora),
+        ).fetchone()
+        if choque:
+            return f"No se puede agendar: ya existe audiencia el {fecha_audiencia} a las {hora} ({choque[0]} - {choque[1]})."
+        with conexion:
+            conexion.execute(
+                "INSERT INTO causas VALUES (?, ?, ?, ?, ?, ?, 'Pendiente', ?)",
+                (expediente, materia, partes, tipo_acto, fecha_audiencia, hora, fecha_limite_plazo),
+            )
+    finally:
+        conexion.close()
+    return f"Audiencia programada en Killa: {expediente} ({partes}) el {fecha_audiencia} a las {hora}."
+
+
 # ═══ S2 · RAG: buscar en mis documentos (PDFs) y citar la fuente ══════════════════════
-DOCUMENTOS = DATOS / "documentos"  # PDFs ficticios de finanzas personales
+DOCUMENTOS = DATOS / "documentos"
 
 
 def embeddings_de(textos: list[str]) -> list[list[float]]:
     """Convierte cada texto en un vector: textos de significado parecido dan vectores cercanos."""
-    # Gemini también ofrece una API compatible con la de OpenAI; la usamos para los embeddings
     cliente = OpenAI(
         api_key=settings.gemini_api_key_local.get_secret_value(),
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
@@ -146,18 +299,16 @@ def embeddings_de(textos: list[str]) -> list[list[float]]:
     return [item.embedding for item in respuesta.data]
 
 
-@cache  # se indexa la primera vez que alguien busca, y una sola vez mientras el programa corre
+@cache
 def indice():
-    # Base vectorial en memoria (se pierde al terminar); "cosine" mide la cercanía por el ángulo
     coleccion = chromadb.EphemeralClient().get_or_create_collection(
         "documentos", configuration={"hnsw": {"space": "cosine"}}
     )
     for pdf in sorted(DOCUMENTOS.glob("*.pdf")):
         texto = "\n".join(pagina.extract_text() for pagina in PdfReader(pdf).pages)
-        # Trozos de ~300 caracteres que se solapan 50, para no cortar una idea por la mitad
         trozos = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=50).split_text(texto)
         coleccion.upsert(
-            ids=[f"{pdf.stem}-{i}" for i in range(len(trozos))],  # el id dice de qué PDF sale: sirve para citar
+            ids=[f"{pdf.stem}-{i}" for i in range(len(trozos))],
             documents=trozos,
             embeddings=embeddings_de(trozos),
         )
@@ -175,11 +326,10 @@ def buscar(pregunta: str, k: int = 3) -> list[dict]:
 
 documentos = Capability(
     id="mis_documentos",
-    description="Documentos de finanzas personales: contratos, facturas y garantías",
-    # Citar la fuente y admitir cuando no hay datos: así se ve qué sale de los documentos y qué no
+    description="Documentos del despacho, protocolos judiciales, plazos procesales, contratos y normativa",
     instructions=(
-        "Para preguntas sobre pagos, contratos o garantías usa buscar_documentos y cita la fuente "
-        "entre corchetes, por ejemplo [contrato_alquiler-1]. "
+        "Para preguntas sobre plazos legales, protocolos de audiencias, contratos, pagos o normativa "
+        "usa buscar_documentos y cita la fuente entre corchetes, por ejemplo [protocolo_audiencias-1]. "
         "Si no hay información suficiente para responder, di que no lo encuentras, no lo inventes."
     ),
 )
@@ -189,6 +339,6 @@ documentos = Capability(
 def buscar_documentos(pregunta: str) -> list[dict]:
     """Busca en los documentos los fragmentos que responden a la pregunta."""
     resultados = buscar(pregunta, k=3)
-    for r in resultados:  # en la terminal (o en los Logs de Render) se ve qué recuperó
+    for r in resultados:
         print(f"  📄 {r['fuente']} (similitud {r['similitud']})", flush=True)
     return resultados
